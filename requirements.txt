@@ -1,0 +1,7 @@
+torch>=2.0
+torchvision>=0.15
+timm>=0.9
+numpy
+pandas
+Pillow
+scikit-learn>=1.0

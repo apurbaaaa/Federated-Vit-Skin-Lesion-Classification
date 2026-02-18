@@ -1,0 +1,148 @@
+# ============================================================================
+# ISIC 2019 Hybrid Segmentation-Guided ViT Configuration
+# ============================================================================
+
+# Data paths
+data:
+  isic_dir: "./ISIC"
+  train_gt: "ISIC_2019_Training_GroundTruth.csv"
+  test_gt: "ISIC_2019_Test_GroundTruth.csv"
+  train_meta: "ISIC_2019_Training_Metadata.csv"
+  test_meta: "ISIC_2019_Test_Metadata.csv"
+  train_images: "ISIC_2019_Training_Input"
+  test_images: "ISIC_2019_Test_Input"
+  # Optional segmentation masks (set to null if unavailable)
+  train_masks: null  # "ISIC_2019_Training_Segmentation"
+  
+# Classes (8-class, no UNK)
+classes:
+  names: ["MEL", "NV", "BCC", "AK", "BKL", "DF", "VASC", "SCC"]
+  num_classes: 8
+
+# Model architecture
+model:
+  # Backbone: "swin_base_patch4_window12_384.ms_in22k_ft_in1k", "swin_small_patch4_window7_224.ms_in22k_ft_in1k"
+  backbone: "swin_base_patch4_window12_384.ms_in22k_ft_in1k"
+  image_size: 384
+  pretrained: true
+  drop_path_rate: 0.2
+  
+  # Segmentation branch
+  segmentation:
+    enabled: false  # Set true if masks available
+    encoder_channels: [64, 128, 256, 512]
+    decoder_channels: [256, 128, 64, 32]
+    fusion_type: "attention"  # "attention", "concat", "cross_attention"
+    seg_loss_weight: 0.3  # λ for joint loss
+  
+  # Metadata fusion
+  metadata:
+    enabled: true
+    features: ["age_approx", "sex", "anatom_site_general"]
+    embed_dim: 64
+    
+  # Classifier head
+  classifier:
+    hidden_dim: 512
+    dropout: 0.3
+
+# Training
+training:
+  # Two-stage training
+  stage1:
+    epochs: 5
+    lr: 1e-3
+    freeze_backbone: true
+    
+  stage2:
+    epochs: 30
+    lr: 5e-5
+    freeze_backbone: false
+    
+  # General
+  batch_size: 16  # Smaller for 384x384
+  val_ratio: 0.2
+  weight_decay: 0.05
+  grad_clip: 1.0
+  
+  # Layer-wise LR decay
+  llrd:
+    enabled: true
+    decay_rate: 0.75
+    
+  # Scheduler
+  scheduler:
+    type: "cosine"
+    warmup_epochs: 3
+    min_lr: 1e-7
+    
+  # EMA
+  ema:
+    enabled: true
+    decay: 0.9998
+    
+# Augmentation
+augmentation:
+  # MixUp / CutMix
+  mixup:
+    enabled: true
+    alpha: 0.2
+  cutmix:
+    enabled: true
+    alpha: 1.0
+    prob: 0.5
+    
+  # RandAugment
+  randaugment:
+    enabled: true
+    num_ops: 2
+    magnitude: 9
+    
+  # Standard augmentations
+  random_resized_crop:
+    scale: [0.7, 1.0]
+    ratio: [0.9, 1.1]
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.3
+    hue: 0.1
+  rotation: 30
+  hflip: 0.5
+  vflip: 0.5
+
+# Loss
+loss:
+  # "asymmetric", "focal", "cross_entropy"
+  type: "asymmetric"
+  asymmetric:
+    gamma_neg: 4
+    gamma_pos: 1
+    clip: 0.05
+  focal:
+    gamma: 2.0
+    alpha: null  # Use class weights
+  label_smoothing: 0.0  # Removed as requested
+  class_weights: true
+
+# Test-time augmentation
+tta:
+  enabled: true
+  transforms: ["original", "hflip", "vflip", "crop_center", "crop_tl", "crop_br"]
+  
+# K-fold ensemble
+kfold:
+  enabled: false
+  n_folds: 5
+  
+# Checkpointing
+checkpoint:
+  dir: "./checkpoints"
+  save_best: true
+  save_last: true
+
+# Misc
+seed: 42
+device: "auto"  # "auto", "mps", "cuda", "cpu"
+num_workers: 0  # 0 for MPS compatibility
+pin_memory: false

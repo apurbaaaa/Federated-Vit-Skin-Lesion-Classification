@@ -1,0 +1,109 @@
+# ============================================================================
+# ISIC 2019 Classification with Precomputed Segmentation Masks
+# ============================================================================
+# Optimized for efficiency: 224px, single split, no EMA during tuning
+
+seed: 42
+device: "auto"  # auto, mps, cuda, cpu
+
+# Data paths
+data:
+  isic_dir: "./ISIC"
+  
+  # Segmentation mask settings
+  use_segmentation_mask: true
+  segmentation_mask_dir: "./masks"
+
+# Classes (8-class, no UNK)
+classes:
+  names: ["MEL", "NV", "BCC", "AK", "BKL", "DF", "VASC", "SCC"]
+  num_classes: 8
+
+# Model architecture
+model:
+  # Backbone options: 
+  # - "swin_small_patch4_window7_224.ms_in22k_ft_in1k" (22M params, fast)
+  # - "swin_base_patch4_window7_224.ms_in22k_ft_in1k" (87M params)
+  backbone: "swin_small_patch4_window7_224.ms_in22k_ft_in1k"
+  image_size: 224
+  num_classes: 8
+  pretrained: true
+  drop_path_rate: 0.2
+  
+  # Metadata fusion (optional)
+  metadata:
+    enabled: false  # Disable for faster debugging
+    embed_dim: 64
+    
+  # Classifier head
+  classifier:
+    hidden_dim: 512
+    dropout: 0.3
+
+# Training
+training:
+  # Two-stage training
+  stage1:
+    epochs: 5
+    lr: 0.001
+    freeze_backbone: true
+    
+  stage2:
+    epochs: 25
+    lr: 0.00005
+    freeze_backbone: false
+    
+  # General
+  batch_size: 32
+  val_ratio: 0.2
+  weight_decay: 0.05
+  grad_clip: 1.0
+  num_workers: 0  # MPS-safe
+  
+  # Layer-wise LR decay
+  llrd:
+    enabled: true
+    decay_rate: 0.75
+    
+  # Scheduler
+  scheduler:
+    type: "cosine"
+    warmup_epochs: 3
+    min_lr: 0.0000001
+
+# Augmentation
+augmentation:
+  # MixUp / CutMix
+  mixup:
+    enabled: true
+    alpha: 0.2
+  cutmix:
+    enabled: true
+    alpha: 1.0
+    prob: 0.5
+    
+  # RandAugment (applied in dataset)
+  randaugment:
+    enabled: true
+    n: 2
+    m: 9
+
+# Loss
+loss:
+  type: "asymmetric"  # asymmetric, focal, cross_entropy
+  class_weights: true
+  label_smoothing: 0.0
+  
+  # Asymmetric Loss params
+  asymmetric:
+    gamma_neg: 4
+    gamma_pos: 1
+    clip: 0.05
+    
+  # Focal Loss params (if type: focal)
+  focal:
+    gamma: 2.0
+
+# Checkpoint
+checkpoint:
+  dir: "./checkpoints"
