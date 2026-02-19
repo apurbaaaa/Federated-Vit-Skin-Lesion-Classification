@@ -1,32 +1,35 @@
 #!/usr/bin/env python3
 """
-ISIC 2019 Skin Lesion Classification Training Script.
+train.py — 5-Fold Stratified CV with SwinV2-Large ISIC classifier.
 
-Simplified pipeline with precomputed segmentation masks:
-    - Two-stage training (head-only → full fine-tuning)
-    - Layer-wise learning rate decay (LLRD)
-    - MixUp + CutMix augmentation
-    - Asymmetric Loss for class imbalance
-    - Warmup + Cosine LR scheduler
-    - Gradient clipping
-
-Usage:
-    python train.py --config config.yaml
+Features
+────────
+  • 5-Fold StratifiedKFold (or StratifiedGroupKFold when lesion_id available)
+  • Mixed precision (AMP)
+  • EMA (decay 0.9995)
+  • MixUp / CutMix
+  • Warmup + Cosine LR
+  • Gradient clipping
+  • TTA evaluation on test set
+  • Auto batch-size probe
+  • Fold-averaged test logits
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-from torch.optim import AdamW
+import torch.nn.functional as F
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
@@ -34,605 +37,442 @@ from sklearn.metrics import (
     confusion_matrix,
     f1_score,
 )
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
+from tqdm import tqdm
 
 from data import (
     VALID_CLASSES,
     NUM_CLASSES,
-    build_dataloaders,
-    compute_class_weights,
     load_isic_data,
+    build_fold_loaders,
+    build_tta_loader,
+    build_test_loader,
     print_class_distribution,
 )
-from model import build_model
-from losses import build_classification_loss
+from losses import build_loss
+from model import build_model, count_parameters, get_layerwise_lr_groups
 from utils import (
-    Mixup_Cutmix,
+    EMA,
+    MixupCutmix,
     WarmupCosineScheduler,
+    auto_batch_size,
     clip_grad_norm,
+    evaluate,
+    evaluate_with_tta,
     get_device,
+    load_checkpoint,
     load_config,
     mixup_criterion,
-    mps_empty_cache,
-    mps_sync,
     save_checkpoint,
     seed_everything,
 )
 
 
-def setup_logging(log_file: Optional[str] = None) -> None:
-    """Configure logging to stdout and optionally a file."""
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
-    if log_file:
-        handlers.append(logging.FileHandler(log_file, mode="a"))
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(message)s",
-        handlers=handlers,
-        force=True,
-    )
-    # Redirect print → logging so everything goes to the file too
-    import builtins
-    _original_print = builtins.print
+# ============================================================================
+# Logging
+# ============================================================================
 
-    def _logged_print(*args, **kwargs):
-        msg = " ".join(str(a) for a in args)
-        logging.info(msg)
-
-    builtins.print = _logged_print
+def setup_logging(log_dir: str, fold: int = -1) -> logging.Logger:
+    os.makedirs(log_dir, exist_ok=True)
+    tag = f"fold{fold}" if fold >= 0 else "main"
+    logger = logging.getLogger(f"isic_{tag}")
+    logger.setLevel(logging.INFO)
+    # console
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%H:%M:%S"))
+    logger.addHandler(ch)
+    # file
+    fh = logging.FileHandler(os.path.join(log_dir, f"train_{tag}.log"))
+    fh.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+    logger.addHandler(fh)
+    return logger
 
 
 # ============================================================================
-# Training Loop
+# Training one epoch
 # ============================================================================
 
 def train_one_epoch(
     model: nn.Module,
-    loader: torch.utils.data.DataLoader,
-    criterion: nn.Module,
-    optimizer: torch.optim.Optimizer,
+    loader,
+    criterion,
+    optimizer,
+    scheduler,             # stepped per-epoch (after this function)
+    scaler,                # torch.amp.GradScaler
+    ema: Optional[EMA],
     device: torch.device,
-    epoch: int,
     config: dict,
-    mixup_cutmix: Optional[Mixup_Cutmix] = None,
+    epoch: int,
+    logger: logging.Logger,
 ) -> float:
-    """Train for one epoch.
-    
-    Returns
-    -------
-    float
-        Average loss.
-    """
     model.train()
+    t_cfg = config.get("training", {})
+    use_amp = t_cfg.get("use_amp", True) and device.type == "cuda"
+    grad_clip = t_cfg.get("grad_clip", 1.0)
+    accum_steps = max(1, t_cfg.get("gradient_accumulation_steps", 1))
+    use_meta = config.get("model", {}).get("metadata", {}).get("enabled", True)
+
+    aug_cfg = config.get("augmentation", {})
+    mixer = None
+    mixup_a = aug_cfg.get("mixup", {}).get("alpha", 0.0)
+    cutmix_p = aug_cfg.get("cutmix", {}).get("prob", 0.0)
+    if mixup_a > 0 or cutmix_p > 0:
+        mixer = MixupCutmix(
+            mixup_alpha=mixup_a,
+            cutmix_alpha=aug_cfg.get("cutmix", {}).get("alpha", 1.0),
+            cutmix_prob=cutmix_p,
+        )
+
     running_loss = 0.0
-    num_batches = len(loader)
-    
-    train_cfg = config.get("training", {})
-    max_grad_norm = float(train_cfg.get("grad_clip", 1.0))
-    use_metadata = config.get("model", {}).get("metadata", {}).get("enabled", False)
-    
-    for batch_idx, batch in enumerate(loader):
+    total = 0
+    optimizer.zero_grad(set_to_none=True)
+    pbar = tqdm(loader, desc=f"  Train E{epoch:02d}", leave=False, dynamic_ncols=True)
+
+    for step, batch in enumerate(pbar):
         images = batch["image"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
-        
-        # Metadata
-        metadata = None
-        if use_metadata and "metadata" in batch:
-            metadata = {
-                "age": batch["metadata"]["age"].to(device),
-                "sex": batch["metadata"]["sex"].to(device),
-                "site": batch["metadata"]["site"].to(device),
-            }
-        
-        # Apply MixUp/CutMix
-        if mixup_cutmix is not None:
-            images, labels_a, labels_b, lam = mixup_cutmix(images, labels)
-        
-        # Forward
-        optimizer.zero_grad()
-        outputs = model(images, metadata=metadata)
-        logits = outputs["logits"]
-        
-        # Compute loss
-        if mixup_cutmix is not None:
-            loss = mixup_criterion(criterion, logits, labels_a, labels_b, lam)
-        else:
-            loss = criterion(logits, labels)
-        
-        # Backward
-        loss.backward()
-        
-        # Gradient clipping
-        if max_grad_norm > 0:
-            clip_grad_norm(model.parameters(), max_grad_norm)
-        
-        # Optimizer step
-        optimizer.step()
-        
-        running_loss += loss.item()
-        
-        # Logging
-        if (batch_idx + 1) % 50 == 0:
-            print(f"  [Epoch {epoch}] Batch {batch_idx + 1}/{num_batches}  loss={loss.item():.4f}")
-        
-        # MPS sync
-        if (batch_idx + 1) % 25 == 0:
-            mps_sync()
-    
-    mps_sync()
-    mps_empty_cache()
-    
-    return running_loss / num_batches
+        meta = batch.get("metadata")
+        if meta is not None:
+            meta = meta.to(device, non_blocking=True)
+        bs = images.size(0)
 
+        # MixUp / CutMix
+        do_mix = mixer is not None
+        if do_mix:
+            images, labels_a, labels_b, lam = mixer(images, labels)
+
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            out = model(images, metadata=meta if use_meta else None)
+            logits = out["logits"]
+            if do_mix:
+                loss = mixup_criterion(criterion, logits, labels_a, labels_b, lam)
+            else:
+                loss = criterion(logits, labels)
+            loss = loss / accum_steps  # scale for accumulation
+
+        scaler.scale(loss).backward()
+
+        if (step + 1) % accum_steps == 0 or (step + 1) == len(loader):
+            scaler.unscale_(optimizer)
+            clip_grad_norm(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            if ema is not None:
+                ema.update()
+
+        running_loss += loss.item() * accum_steps * bs
+        total += bs
+        pbar.set_postfix(loss=f"{running_loss / total:.4f}")
+
+    return running_loss / max(total, 1)
+
+
+# ============================================================================
+# Validation
+# ============================================================================
 
 @torch.no_grad()
-def evaluate(
+def validate(
     model: nn.Module,
-    loader: torch.utils.data.DataLoader,
+    loader,
+    criterion,
     device: torch.device,
     config: dict,
-) -> Dict:
-    """Evaluate model and return comprehensive metrics."""
+) -> dict:
     model.eval()
+    use_amp = config.get("training", {}).get("use_amp", True) and device.type == "cuda"
+    use_meta = config.get("model", {}).get("metadata", {}).get("enabled", True)
+
     running_loss = 0.0
-    all_preds: List[int] = []
-    all_labels: List[int] = []
-    
-    use_metadata = config.get("model", {}).get("metadata", {}).get("enabled", False)
-    
+    total = 0
+    all_preds, all_labels = [], []
+
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
-        
-        metadata = None
-        if use_metadata and "metadata" in batch:
-            metadata = {
-                "age": batch["metadata"]["age"].to(device),
-                "sex": batch["metadata"]["sex"].to(device),
-                "site": batch["metadata"]["site"].to(device),
-            }
-        
-        outputs = model(images, metadata=metadata)
-        logits = outputs["logits"]
-        
-        # Simple CE loss for evaluation
-        loss = nn.functional.cross_entropy(logits, labels)
-        running_loss += loss.item() * images.size(0)
-        
-        mps_sync()
-        
-        preds = logits.argmax(dim=1).cpu().tolist()
-        all_preds.extend(preds)
+        meta = batch.get("metadata")
+        if meta is not None:
+            meta = meta.to(device, non_blocking=True)
+
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            logits = model(images, metadata=meta if use_meta else None)["logits"]
+            loss = criterion(logits, labels)
+
+        bs = images.size(0)
+        running_loss += loss.item() * bs
+        total += bs
+        all_preds.extend(logits.argmax(1).cpu().tolist())
         all_labels.extend(labels.cpu().tolist())
-    
-    total = len(all_labels)
-    avg_loss = running_loss / max(total, 1)
-    
-    # Metrics
-    accuracy = accuracy_score(all_labels, all_preds)
-    balanced_acc = balanced_accuracy_score(all_labels, all_preds)
-    macro_f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
-    
-    # Confusion matrix (8x8)
-    cm = confusion_matrix(all_labels, all_preds, labels=list(range(NUM_CLASSES)))
-    
-    # Per-class recall
-    per_class_recall = []
-    for i in range(NUM_CLASSES):
-        if cm[i].sum() > 0:
-            recall = cm[i, i] / cm[i].sum()
-        else:
-            recall = 0.0
-        per_class_recall.append(recall)
-    
+
+    n = max(total, 1)
     return {
-        "loss": avg_loss,
-        "accuracy": accuracy,
-        "balanced_accuracy": balanced_acc,
-        "macro_f1": macro_f1,
-        "confusion_matrix": cm,
-        "per_class_recall": per_class_recall,
-        "all_preds": all_preds,
-        "all_labels": all_labels,
+        "loss": running_loss / n,
+        "accuracy": accuracy_score(all_labels, all_preds),
+        "balanced_accuracy": balanced_accuracy_score(all_labels, all_preds),
+        "macro_f1": f1_score(all_labels, all_preds, average="macro", zero_division=0),
     }
 
 
-def print_metrics(metrics: Dict, split_name: str = "Val") -> None:
-    """Print evaluation metrics."""
-    print(f"\n[{split_name}] Metrics:")
-    print(f"  Loss             : {metrics['loss']:.4f}")
-    print(f"  Accuracy         : {metrics['accuracy']:.4f}")
-    print(f"  Balanced Accuracy: {metrics['balanced_accuracy']:.4f}")
-    print(f"  Macro F1         : {metrics['macro_f1']:.4f}")
-    
-    print(f"\n[{split_name}] Per-class Recall:")
-    for idx, name in enumerate(VALID_CLASSES):
-        print(f"  {name:5s}: {metrics['per_class_recall'][idx]:.4f}")
-
-
-def print_confusion_matrix(cm: np.ndarray) -> None:
-    """Print confusion matrix."""
-    header = "      " + " ".join(f"{name:>5s}" for name in VALID_CLASSES)
-    print(f"\nConfusion Matrix (8x8):\n{header}")
-    for i, name in enumerate(VALID_CLASSES):
-        row = " ".join(f"{cm[i, j]:5d}" for j in range(NUM_CLASSES))
-        print(f"  {name:5s}: {row}")
-
-
 # ============================================================================
-# Training
+# Single fold
 # ============================================================================
 
-def train(config: dict, resume_path: Optional[str] = None) -> Dict:
-    """Main training function.
-
-    Parameters
-    ----------
-    config : dict
-        Full configuration dictionary.
-    resume_path : str, optional
-        Path to checkpoint to resume Stage 2 from.
+def train_fold(
+    fold: int,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    config: dict,
+    device: torch.device,
+    log_dir: str,
+) -> np.ndarray:
     """
-    data_cfg = config.get("data", {})
-    model_cfg = config.get("model", {})
-    train_cfg = config.get("training", {})
-    loss_cfg = config.get("loss", {})
-    aug_cfg = config.get("augmentation", {})
-    ckpt_cfg = config.get("checkpoint", {})
-    
-    # Device
-    device = get_device(config.get("device", "auto"))
-    print(f"\nDevice: {device}")
-    
-    print("\n" + "=" * 70)
-    print("TRAINING")
-    print("=" * 70)
-    
-    # =========================================================================
-    # Load Data
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("LOADING DATA")
-    print("=" * 70)
-    
-    train_df, val_df, test_df = load_isic_data(
-        isic_dir=data_cfg.get("isic_dir", "./ISIC"),
-        val_ratio=float(train_cfg.get("val_ratio", 0.2)),
-        random_state=config.get("seed", 42),
-    )
-    
-    print_class_distribution(train_df, "Train")
-    print_class_distribution(val_df, "Val")
-    print_class_distribution(test_df, "Test")
-    
-    # Build dataloaders
-    train_loader, val_loader, test_loader = build_dataloaders(
-        train_df, val_df, test_df, config
-    )
-    
-    # Class weights
-    class_weights = compute_class_weights(train_df["label"].tolist())
-    class_weights = class_weights.to(device)
-    
-    print("\n[Data] Class weights:")
-    for idx, name in enumerate(VALID_CLASSES):
-        print(f"  {name:5s}: {class_weights[idx].item():.4f}")
-    
-    print(f"\nDataset sizes:")
-    print(f"  Train: {len(train_df):,}")
-    print(f"  Val  : {len(val_df):,}")
-    print(f"  Test : {len(test_df):,}")
-    
-    # =========================================================================
-    # Model Setup
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("MODEL SETUP")
-    print("=" * 70)
-    
+    Train one fold end-to-end. Returns test-set logits (N, C).
+    """
+    logger = setup_logging(log_dir, fold=fold)
+    logger.info(f"{'='*60}")
+    logger.info(f" FOLD {fold}")
+    logger.info(f"{'='*60}")
+    logger.info(f" Train: {len(train_df):,}  |  Val: {len(val_df):,}")
+
+    t_cfg = config.get("training", {})
+    epochs = t_cfg.get("epochs", 80)
+    patience = t_cfg.get("early_stopping", {}).get("patience", 15)
+    metric_name = t_cfg.get("early_stopping", {}).get("metric", "balanced_accuracy")
+
+    # Model
     model = build_model(config).to(device)
-    
-    counts = model.count_parameters()
-    print(f"Total parameters    : {counts['total']:,}")
-    print(f"Backbone parameters : {counts['backbone']:,}")
-    print(f"Classifier params   : {counts['classifier']:,}")
-    if "metadata" in counts:
-        print(f"Metadata params     : {counts['metadata']:,}")
-    
-    # =========================================================================
-    # Loss Function (Asymmetric Loss only)
-    # =========================================================================
-    criterion = build_classification_loss(
-        loss_type=loss_cfg.get("type", "asymmetric"),
-        class_weights=class_weights if loss_cfg.get("class_weights", True) else None,
-        gamma_neg=float(loss_cfg.get("asymmetric", {}).get("gamma_neg", 4)),
-        gamma_pos=float(loss_cfg.get("asymmetric", {}).get("gamma_pos", 1)),
-        clip=float(loss_cfg.get("asymmetric", {}).get("clip", 0.05)),
-        focal_gamma=float(loss_cfg.get("focal", {}).get("gamma", 2.0)),
-        label_smoothing=float(loss_cfg.get("label_smoothing", 0.0)),
+    logger.info(f" Parameters: {count_parameters(model):,.0f}")
+
+    # EMA
+    ema_cfg = t_cfg.get("ema", {})
+    ema = EMA(model, decay=ema_cfg.get("decay", 0.9995)) if ema_cfg.get("enabled", True) else None
+
+    # Optimizer — with layer-wise LR
+    opt_cfg = t_cfg.get("optimizer", {})
+    llrd_cfg = t_cfg.get("llrd", {})
+    lr_groups = get_layerwise_lr_groups(
+        model,
+        base_lr=opt_cfg.get("lr", 1e-4),
+        decay_rate=llrd_cfg.get("decay_rate", 0.75) if llrd_cfg.get("enabled", True) else 1.0,
+        weight_decay=opt_cfg.get("weight_decay", 1e-5),
     )
-    print(f"\nLoss: {loss_cfg.get('type', 'asymmetric')}")
-    
-    # =========================================================================
-    # Augmentation
-    # =========================================================================
-    mixup_cutmix = None
-    if aug_cfg.get("mixup", {}).get("enabled", True) or aug_cfg.get("cutmix", {}).get("enabled", True):
-        mixup_cutmix = Mixup_Cutmix(
-            mixup_alpha=float(aug_cfg.get("mixup", {}).get("alpha", 0.2)),
-            cutmix_alpha=float(aug_cfg.get("cutmix", {}).get("alpha", 1.0)),
-            cutmix_prob=float(aug_cfg.get("cutmix", {}).get("prob", 0.5)),
-        )
-        print(f"MixUp+CutMix: mixup_alpha={aug_cfg.get('mixup', {}).get('alpha', 0.2)}, "
-              f"cutmix_alpha={aug_cfg.get('cutmix', {}).get('alpha', 1.0)}")
-    
-    # Best tracking
-    best_val_metric = float("inf")
-    best_epoch = 0
-    resume_epoch = 0  # Stage-2-local epoch to resume from (0 = start fresh)
-    
-    # Checkpoint directory
-    ckpt_dir = Path(ckpt_cfg.get("dir", "./checkpoints"))
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    
-    # =========================================================================
-    # Resume from checkpoint (skip Stage 1, continue Stage 2)
-    # =========================================================================
-    if resume_path:
-        ckpt = torch.load(resume_path, map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"])
-        best_val_metric = ckpt.get("best_metric", float("inf"))
-        best_epoch = ckpt.get("epoch", 0)
-        s1_epochs_done = int(train_cfg.get("stage1", {}).get("epochs", 5))
-        resume_epoch = best_epoch - s1_epochs_done  # local Stage 2 epoch
-        print(f"\n[Resume] Loaded checkpoint from epoch {best_epoch} "
-              f"(Stage 2 local epoch {resume_epoch})")
-        print(f"[Resume] Best val_loss so far: {best_val_metric:.4f}")
-        print(f"[Resume] Skipping Stage 1, resuming Stage 2 from epoch {resume_epoch + 1}")
-    
-    # =========================================================================
-    # Stage 1: Head-Only Training
-    # =========================================================================
-    stage1_cfg = train_cfg.get("stage1", {})
-    stage1_epochs = int(stage1_cfg.get("epochs", 5))
-    
-    if stage1_epochs > 0 and not resume_path:
-        print("\n" + "=" * 70)
-        print("STAGE 1: HEAD-ONLY TRAINING")
-        print("=" * 70)
-        
-        model.freeze_backbone()
-        
-        head_params = model.get_head_parameters()
-        optimizer_s1 = AdamW(
-            head_params,
-            lr=float(stage1_cfg.get("lr", 1e-3)),
-            weight_decay=float(train_cfg.get("weight_decay", 0.05)),
-        )
-        
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"\n[Stage 1] Trainable parameters: {trainable:,}")
-        print(f"[Stage 1] LR: {float(stage1_cfg.get('lr', 1e-3))}")
-        
-        for epoch in range(1, stage1_epochs + 1):
-            start_time = time.time()
-            
-            train_loss = train_one_epoch(
-                model=model,
-                loader=train_loader,
-                criterion=criterion,
-                optimizer=optimizer_s1,
-                device=device,
-                epoch=epoch,
-                config=config,
-                mixup_cutmix=mixup_cutmix,
-            )
-            
-            val_metrics = evaluate(model, val_loader, device, config)
-            elapsed = time.time() - start_time
-            
-            print(f"\n[Stage 1] Epoch [{epoch}/{stage1_epochs}]  "
-                  f"train_loss={train_loss:.4f}  "
-                  f"val_loss={val_metrics['loss']:.4f}  "
-                  f"val_acc={val_metrics['accuracy']:.4f}  "
-                  f"val_bal_acc={val_metrics['balanced_accuracy']:.4f}  "
-                  f"time={elapsed:.1f}s")
-            
-            if val_metrics["loss"] < best_val_metric:
-                best_val_metric = val_metrics["loss"]
-                best_epoch = epoch
-                
-                save_checkpoint(
-                    model, optimizer_s1, None, None, epoch, best_val_metric,
-                    str(ckpt_dir / "best_model.pt"),
-                    config=config,
-                )
-                print(f"  ✓ Saved best checkpoint (val_loss={best_val_metric:.4f})")
-    
-    # =========================================================================
-    # Stage 2: Full Fine-Tuning
-    # =========================================================================
-    stage2_cfg = train_cfg.get("stage2", {})
-    stage2_epochs = int(stage2_cfg.get("epochs", 25))
-    
-    print("\n" + "=" * 70)
-    print("STAGE 2: FULL MODEL FINE-TUNING")
-    print("=" * 70)
-    
-    model.unfreeze_backbone()
-    
-    # Layer-wise LR decay
-    llrd_cfg = train_cfg.get("llrd", {})
-    if llrd_cfg.get("enabled", True):
-        param_groups = model.get_layerwise_lr_groups(
-            base_lr=float(stage2_cfg.get("lr", 5e-5)),
-            decay_rate=float(llrd_cfg.get("decay_rate", 0.75)),
-            weight_decay=float(train_cfg.get("weight_decay", 0.05)),
-        )
-        optimizer_s2 = AdamW(param_groups)
-        print(f"\n[Stage 2] Layer-wise LR decay (rate={float(llrd_cfg.get('decay_rate', 0.75))})")
-    else:
-        optimizer_s2 = AdamW(
-            model.parameters(),
-            lr=float(stage2_cfg.get("lr", 5e-5)),
-            weight_decay=float(train_cfg.get("weight_decay", 0.05)),
-        )
-    
+    optimizer = torch.optim.AdamW(lr_groups, weight_decay=opt_cfg.get("weight_decay", 1e-5))
+
     # Scheduler
-    sched_cfg = train_cfg.get("scheduler", {})
-    scheduler = WarmupCosineScheduler(
-        optimizer_s2,
-        warmup_epochs=int(sched_cfg.get("warmup_epochs", 3)),
-        total_epochs=stage2_epochs,
-        min_lr=float(sched_cfg.get("min_lr", 1e-7)),
-    )
-    
-    # Fast-forward scheduler to resume point
-    if resume_path and resume_epoch > 0:
-        for _ in range(resume_epoch):
-            scheduler.step()
-        print(f"[Resume] Scheduler fast-forwarded {resume_epoch} steps  "
-              f"(current lr={scheduler.get_last_lr()[0]:.2e})")
-    
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[Stage 2] Trainable parameters: {trainable:,}")
-    print(f"[Stage 2] Base LR: {float(stage2_cfg.get('lr', 5e-5))}")
-    print(f"[Stage 2] Scheduler: Warmup({sched_cfg.get('warmup_epochs', 3)}) + Cosine")
-    
-    start_s2_epoch = resume_epoch + 1 if resume_path else 1
-    for epoch in range(start_s2_epoch, stage2_epochs + 1):
-        global_epoch = stage1_epochs + epoch
-        start_time = time.time()
-        
+    warmup = t_cfg.get("scheduler", {}).get("warmup_epochs", 5)
+    min_lr = t_cfg.get("scheduler", {}).get("min_lr", 1e-6)
+    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=warmup, total_epochs=epochs, min_lr=min_lr)
+
+    # AMP
+    use_amp = t_cfg.get("use_amp", True) and device.type == "cuda"
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
+
+    # Loss
+    criterion = build_loss(config).to(device)
+
+    # Dataloaders
+    train_loader, val_loader = build_fold_loaders(train_df, val_df, config)
+
+    # Checkpoint dir
+    os.makedirs(log_dir, exist_ok=True)
+
+    for epoch in range(1, epochs + 1):
+        t0 = time.time()
         train_loss = train_one_epoch(
-            model=model,
-            loader=train_loader,
-            criterion=criterion,
-            optimizer=optimizer_s2,
-            device=device,
-            epoch=global_epoch,
-            config=config,
-            mixup_cutmix=mixup_cutmix,
+            model, train_loader, criterion, optimizer, scheduler,
+            scaler, ema, device, config, epoch, logger,
         )
-        
+
+        # Swap EMA for validation
+        if ema is not None:
+            ema.apply_shadow()
+
+        val_metrics = validate(model, val_loader, criterion, device, config)
+
+        if ema is not None:
+            ema.restore()
+
         scheduler.step()
-        current_lr = scheduler.get_last_lr()[0]
-        
-        val_metrics = evaluate(model, val_loader, device, config)
-        elapsed = time.time() - start_time
-        
-        print(f"\n[Stage 2] Epoch [{epoch}/{stage2_epochs}] (Global {global_epoch})  "
-              f"lr={current_lr:.2e}  "
-              f"train_loss={train_loss:.4f}  "
-              f"val_loss={val_metrics['loss']:.4f}  "
-              f"val_acc={val_metrics['accuracy']:.4f}  "
-              f"val_bal_acc={val_metrics['balanced_accuracy']:.4f}  "
-              f"time={elapsed:.1f}s")
-        
-        if val_metrics["loss"] < best_val_metric:
-            best_val_metric = val_metrics["loss"]
-            best_epoch = global_epoch
-            
-            save_checkpoint(
-                model, optimizer_s2, scheduler, None, global_epoch, best_val_metric,
-                str(ckpt_dir / "best_model.pt"),
-                config=config,
-            )
-            print(f"  ✓ Saved best checkpoint (val_loss={best_val_metric:.4f})")
-    
-    # =========================================================================
-    # Final Evaluation
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("FINAL EVALUATION ON TEST SET")
-    print("=" * 70)
-    
-    # Load best checkpoint
-    ckpt_path = ckpt_dir / "best_model.pt"
-    if ckpt_path.exists():
-        checkpoint = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        print(f"Loaded best checkpoint from epoch {checkpoint['epoch']}")
-    
-    # Standard evaluation
-    test_metrics = evaluate(model, test_loader, device, config)
-    
-    print_metrics(test_metrics, "Test")
-    print_confusion_matrix(test_metrics["confusion_matrix"])
-    
-    print("\n[Test] Classification Report:")
-    print(classification_report(
-        test_metrics["all_labels"],
-        test_metrics["all_preds"],
-        target_names=VALID_CLASSES,
-        zero_division=0,
-    ))
-    
-    # =========================================================================
-    # Summary
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("TRAINING COMPLETE")
-    print("=" * 70)
-    print(f"Best validation loss: {best_val_metric:.4f} (epoch {best_epoch})")
-    print(f"\nTest Results:")
-    print(f"  Accuracy         : {test_metrics['accuracy']:.4f}")
-    print(f"  Balanced Accuracy: {test_metrics['balanced_accuracy']:.4f}")
-    print(f"  Macro F1         : {test_metrics['macro_f1']:.4f}")
-    
-    return {
-        "best_epoch": best_epoch,
-        "best_val_loss": best_val_metric,
-        "test_metrics": test_metrics,
-        "checkpoint_path": str(ckpt_path),
-    }
+
+        elapsed = time.time() - t0
+        lr_now = optimizer.param_groups[-1]["lr"]
+        logger.info(
+            f"  E{epoch:02d} | trn_loss {train_loss:.4f} | "
+            f"val_loss {val_metrics['loss']:.4f} | val_acc {val_metrics['accuracy']:.4f} | "
+            f"val_bal {val_metrics['balanced_accuracy']:.4f} | val_f1 {val_metrics['macro_f1']:.4f} | "
+            f"lr {lr_now:.2e} | {elapsed:.1f}s"
+        )
+
+        # Best check
+        metric_val = val_metrics[metric_name]
+        if metric_val > best_metric:
+            best_metric = metric_val
+            epochs_without_improve = 0
+            save_checkpoint(model, optimizer, scheduler, ema, epoch, best_metric, ckpt_path, config)
+            logger.info(f"  >>> New best {metric_name}: {best_metric:.4f} — saved.")
+        else:
+            epochs_without_improve += 1
+            if patience > 0 and epochs_without_improve >= patience:
+                logger.info(f"  Early stopping at epoch {epoch} (patience={patience}).")
+                break
+
+    # ── Load best & evaluate on test ──────────────────────────────────────
+    logger.info(f"  Loading best checkpoint (best {metric_name}={best_metric:.4f})")
+    load_checkpoint(ckpt_path, model, ema=ema, device=device)
+    if ema is not None:
+        ema.apply_shadow()
+
+    use_meta = config.get("model", {}).get("metadata", {}).get("enabled", True)
+    use_amp_val = t_cfg.get("use_amp", True)
+
+    if len(test_df) == 0:
+        logger.info("  No test data available — skipping test evaluation.")
+        if ema is not None:
+            ema.restore()
+        return np.zeros((0, NUM_CLASSES))
+
+    # TTA evaluation
+    tta_cfg = t_cfg.get("tta", {})
+    use_tta = tta_cfg.get("enabled", True)
+    if use_tta:
+        logger.info("  Running TTA on test set…")
+        tta_loader = build_tta_loader(test_df, config)
+        preds, labels, logits = evaluate_with_tta(
+            model, tta_loader, device,
+            use_metadata=use_meta,
+            use_amp=use_amp_val,
+        )
+    else:
+        logger.info("  Evaluating on test set (no TTA)…")
+        test_loader = build_test_loader(test_df, config)
+        result = evaluate(
+            model, test_loader, device,
+            use_metadata=use_meta,
+            use_amp=use_amp_val,
+        )
+        preds, labels = result["all_preds"], result["all_labels"]
+        logits = np.zeros((len(preds), NUM_CLASSES))
+        for i, p in enumerate(preds):
+            logits[i, p] = 1.0
+
+    # Only compute metrics if we have ground truth (non-placeholder labels)
+    if test_df["label"].nunique() > 1 or test_df["dx"].iloc[0] != "MEL":
+        acc = accuracy_score(labels, preds)
+        bal = balanced_accuracy_score(labels, preds)
+        f1m = f1_score(labels, preds, average="macro", zero_division=0)
+        logger.info(f"  Fold {fold} Test — acc: {acc:.4f} | bal_acc: {bal:.4f} | macro_f1: {f1m:.4f}")
+        logger.info(f"\n{classification_report(labels, preds, target_names=VALID_CLASSES, digits=4)}")
+
+    if ema is not None:
+        ema.restore()
+
+    return logits  # (N, C)
 
 
 # ============================================================================
 # Main
 # ============================================================================
 
-def main(args: argparse.Namespace) -> None:
-    """Main entry point."""
-    # Setup logging
-    setup_logging(args.log)
-    
-    # Load config
+def main():
+    parser = argparse.ArgumentParser(description="ISIC 2019 — 5-Fold CV Training")
+    parser.add_argument("--config", type=str, default="config.yaml")
+    parser.add_argument("--fold",   type=int, default=-1, help="Run a single fold (-1 = all)")
+    parser.add_argument("--log",    type=str, default="logs")
+    parser.add_argument("--seed",   type=int, default=42)
+    args = parser.parse_args()
+
     config = load_config(args.config)
-    
-    # Override with CLI args
-    if args.batch_size:
-        config.setdefault("training", {})["batch_size"] = args.batch_size
-    if args.epochs:
-        config.setdefault("training", {}).setdefault("stage2", {})["epochs"] = args.epochs
-    
-    # Seed
-    seed_everything(config.get("seed", 42))
-    
-    # Train
-    results = train(config, resume_path=args.resume)
-    
-    print("\n\n✓ Training complete!")
+    seed_everything(args.seed)
+    device = get_device()
 
+    t_cfg = config.get("training", {})
+    d_cfg = config.get("data", {})
+    n_folds = t_cfg.get("cv", {}).get("n_splits", 5)
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="ISIC 2019 Skin Lesion Classification"
-    )
-    
-    parser.add_argument("--config", type=str, default="config.yaml",
-                        help="Path to config file")
-    parser.add_argument("--batch_size", type=int, default=None,
-                        help="Override batch size")
-    parser.add_argument("--epochs", type=int, default=None,
-                        help="Override stage 2 epochs")
-    parser.add_argument("--resume", type=str, default=None,
-                        help="Resume from checkpoint path (skips Stage 1)")
-    parser.add_argument("--log", type=str, default=None,
-                        help="Log file path (logs to both stdout and file)")
-    
-    return parser.parse_args()
+    print(f"\n{'='*60}")
+    print(f"  ISIC 2019 Classifier — {n_folds}-Fold CV")
+    print(f"  Device: {device}")
+    print(f"{'='*60}\n")
+
+    # Load data
+    train_full_df, test_df = load_isic_data(d_cfg.get("isic_dir", "./ISIC"))
+    print_class_distribution(train_full_df, "Full Train")
+    if len(test_df) > 0:
+        print_class_distribution(test_df, "Test")
+
+    accum  = t_cfg.get("gradient_accumulation_steps", 1)
+    eff_bs = t_cfg.get("batch_size", 4) * accum
+    print(f"\n  [Config] physical_bs={t_cfg.get('batch_size', 4)}, "
+          f"accum={accum}, effective_bs={eff_bs}")
+
+    # Auto batch-size (optional — disabled by default for SwinV2-Large)
+    if t_cfg.get("auto_batch_size", False):
+        model_probe = build_model(config).to(device)
+        bs = auto_batch_size(model_probe, device,
+                             image_size=config.get("model", {}).get("image_size", 384))
+        del model_probe
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        config["training"]["batch_size"] = bs
+
+    # Fold split
+    labels = train_full_df["label"].values
+    has_groups = "lesion_id" in train_full_df.columns and train_full_df["lesion_id"].nunique() > 1
+    if has_groups:
+        groups = train_full_df["lesion_id"].values
+        kf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=args.seed)
+        splits = list(kf.split(train_full_df, labels, groups))
+        print(f"[Split] StratifiedGroupKFold (on lesion_id)")
+    else:
+        kf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=args.seed)
+        splits = list(kf.split(train_full_df, labels))
+        print(f"[Split] StratifiedKFold")
+
+    # Which folds to run
+    fold_list = list(range(n_folds)) if args.fold < 0 else [args.fold]
+
+    all_test_logits = []
+    for fold_idx in fold_list:
+        trn_idx, val_idx = splits[fold_idx]
+        trn_df = train_full_df.iloc[trn_idx].reset_index(drop=True)
+        val_df = train_full_df.iloc[val_idx].reset_index(drop=True)
+
+        fold_log_dir = os.path.join(args.log, f"fold{fold_idx}")
+        logits = train_fold(fold_idx, trn_df, val_df, test_df, config, device, fold_log_dir)
+        all_test_logits.append(logits)
+
+    # Fold-averaged ensemble prediction
+    valid_logits = [lg for lg in all_test_logits if len(lg) > 0]
+    if len(valid_logits) > 0 and len(test_df) > 0:
+        avg_logits = np.mean(valid_logits, axis=0)
+        preds = avg_logits.argmax(axis=1)
+        test_labels = test_df["label"].values
+
+        # Save ensemble logits regardless
+        os.makedirs(args.log, exist_ok=True)
+        np.save(os.path.join(args.log, "ensemble_logits.npy"), avg_logits)
+        print(f"\n  Ensemble logits saved → {args.log}/ensemble_logits.npy")
+
+        # Only print metrics if we have real ground truth
+        has_gt = test_df["dx"].nunique() > 1 or test_df["dx"].iloc[0] != "MEL"
+        if has_gt:
+            acc  = accuracy_score(test_labels, preds)
+            bal  = balanced_accuracy_score(test_labels, preds)
+            f1m  = f1_score(test_labels, preds, average="macro", zero_division=0)
+            cm   = confusion_matrix(test_labels, preds, labels=list(range(NUM_CLASSES)))
+            print(f"\n{'='*60}")
+            print(f"  {len(valid_logits)}-Fold ENSEMBLE (averaged logits)")
+            print(f"{'='*60}")
+            print(f"  Accuracy:          {acc:.4f}")
+            print(f"  Balanced Accuracy: {bal:.4f}")
+            print(f"  Macro F1:          {f1m:.4f}")
+            print(f"\n{classification_report(test_labels, preds, target_names=VALID_CLASSES, digits=4)}")
+            print(f"Confusion Matrix:\n{cm}")
+
+    print("\nDone.")
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    main(args)
+    main()

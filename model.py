@@ -1,12 +1,13 @@
 """
-Vision Transformer for ISIC Classification with 4-channel input (RGB + Mask).
+ISIC 2019 — SwinV2-Large-384 with Metadata Fusion.
 
-Architecture:
-    1. Backbone: Swin / ViT with modified input layer for 4 channels
-    2. Metadata Fusion: MLP embedding
-    3. Classifier Head: MLP with dropout
-    
-No segmentation branch - masks are precomputed and used as spatial prior.
+Architecture
+────────────
+  1. Backbone : SwinV2-Large (timm), 384×384, drop_path 0.4
+  2. Metadata : MLP branch  age+sex_onehot+site_onehot → 256 → 128
+  3. Fusion   : concat(image_feat, meta_embed) → 512 → 8
+
+All dimensions are detected dynamically from the backbone.
 """
 
 from __future__ import annotations
@@ -16,53 +17,47 @@ from typing import Dict, List, Optional
 import timm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # ============================================================================
-# Metadata Embedding
+# Metadata Branch  (age + sex-one-hot + site-one-hot)
 # ============================================================================
 
-class MetadataEmbedding(nn.Module):
-    """Embed categorical and numerical metadata features."""
+class MetadataBranch(nn.Module):
+    """
+    Inputs (per sample):
+        age_norm   : float  (1)
+        sex_onehot : (3,)   male / female / unknown
+        site_onehot: (9,)   9 anatomical sites
 
-    def __init__(self, embed_dim: int = 64) -> None:
-        super().__init__()
-        
-        self.embed_dim = embed_dim
-        
-        # Embeddings
-        self.sex_embed = nn.Embedding(3, embed_dim // 4)  # male, female, unknown
-        self.site_embed = nn.Embedding(9, embed_dim // 2)  # 9 anatomical sites
-        
-        # Age projection (continuous)
-        self.age_proj = nn.Sequential(
-            nn.Linear(1, embed_dim // 4),
-            nn.ReLU(inplace=True),
-        )
-        
-        # Final fusion
-        self.fusion = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.LayerNorm(embed_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.1),
-        )
+    Architecture:
+        Linear(input_dim → 256) → BN → GELU → Dropout(0.4)
+        Linear(256 → 128)       → BN → GELU
+    """
 
-    def forward(
+    def __init__(
         self,
-        age: torch.Tensor,
-        sex: torch.Tensor,
-        site: torch.Tensor,
-    ) -> torch.Tensor:
-        if age.dim() == 1:
-            age = age.unsqueeze(1)
-        
-        age_emb = self.age_proj(age)  # (B, embed_dim // 4)
-        sex_emb = self.sex_embed(sex)  # (B, embed_dim // 4)
-        site_emb = self.site_embed(site)  # (B, embed_dim // 2)
-        
-        concat = torch.cat([age_emb, sex_emb, site_emb], dim=1)  # (B, embed_dim)
-        return self.fusion(concat)
+        input_dim: int = 13,
+        hidden_dim: int = 256,
+        output_dim: int = 128,
+        dropout: float = 0.4,
+    ) -> None:
+        super().__init__()
+        self.output_dim = output_dim
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim),
+            nn.BatchNorm1d(output_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x : (B, input_dim)  →  (B, output_dim)"""
+        return self.net(x)
 
 
 # ============================================================================
@@ -70,318 +65,260 @@ class MetadataEmbedding(nn.Module):
 # ============================================================================
 
 class ISICClassifier(nn.Module):
-    """Vision Transformer classifier with 4-channel input support.
-    
+    """Production skin-lesion classifier.
+
     Parameters
     ----------
     backbone_name : str
-        timm model name for backbone.
+        timm model identifier.
     num_classes : int
-        Number of classification classes.
     image_size : int
-        Input image size.
     in_channels : int
-        Number of input channels (3 for RGB, 4 for RGB+mask).
-    pretrained : bool
-        Whether to use pretrained backbone weights.
-    drop_path_rate : float
-        DropPath rate for stochastic depth.
+        3 (RGB) or 4 (RGB+mask).
+    pretrained, drop_path_rate : see timm docs.
     metadata_enabled : bool
-        Whether to use metadata fusion.
-    metadata_embed_dim : int
-        Metadata embedding dimension.
-    classifier_hidden_dim : int
-        Classifier hidden dimension.
-    classifier_dropout : float
-        Classifier dropout rate.
+        Turn on / off the metadata branch.
+    meta_input_dim, meta_hidden_dim, meta_output_dim, meta_dropout :
+        MetadataBranch hyper-parameters.
+    cls_hidden_dim, cls_dropout :
+        Final classifier MLP hyper-parameters.
     """
 
     def __init__(
         self,
-        backbone_name: str = "swin_small_patch4_window7_224.ms_in22k_ft_in1k",
+        backbone_name: str = "swinv2_large_window12to24_192to384.ms_in22k_ft_in1k",
         num_classes: int = 8,
-        image_size: int = 224,
+        image_size: int = 384,
         in_channels: int = 4,
         pretrained: bool = True,
-        drop_path_rate: float = 0.2,
-        metadata_enabled: bool = False,
-        metadata_embed_dim: int = 64,
-        classifier_hidden_dim: int = 512,
-        classifier_dropout: float = 0.3,
+        drop_path_rate: float = 0.4,
+        # metadata
+        metadata_enabled: bool = True,
+        meta_input_dim: int = 13,
+        meta_hidden_dim: int = 256,
+        meta_output_dim: int = 128,
+        meta_dropout: float = 0.4,
+        # classifier
+        cls_hidden_dim: int = 512,
+        cls_dropout: float = 0.5,
     ) -> None:
         super().__init__()
-        
         self.metadata_enabled = metadata_enabled
         self.num_classes = num_classes
         self.image_size = image_size
         self.in_channels = in_channels
-        
-        # =====================================================================
-        # Backbone
-        # =====================================================================
+
+        # ----- backbone (classification head removed) -----------------------
         self.backbone = timm.create_model(
             backbone_name,
             pretrained=pretrained,
-            num_classes=0,  # Remove classifier
+            num_classes=0,           # removes the final head
             drop_path_rate=drop_path_rate,
         )
+        # dynamic feature dim
         self.backbone_dim = self.backbone.num_features
-        
-        # Modify input layer if needed (4 channels)
+        print(f"[Model] Backbone feature dim: {self.backbone_dim}")
+
+        # adapt first conv for 4-channel input
         if in_channels != 3:
             self._modify_input_channels(in_channels, pretrained)
-        
-        # =====================================================================
-        # Metadata Embedding (optional)
-        # =====================================================================
+
+        # ----- metadata branch (optional) -----------------------------------
         if metadata_enabled:
-            self.metadata_embed = MetadataEmbedding(embed_dim=metadata_embed_dim)
-            classifier_input_dim = self.backbone_dim + metadata_embed_dim
+            self.metadata_branch = MetadataBranch(
+                input_dim=meta_input_dim,
+                hidden_dim=meta_hidden_dim,
+                output_dim=meta_output_dim,
+                dropout=meta_dropout,
+            )
+            classifier_in = self.backbone_dim + meta_output_dim
         else:
-            classifier_input_dim = self.backbone_dim
-        
-        # =====================================================================
-        # Classifier Head
-        # =====================================================================
+            classifier_in = self.backbone_dim
+
+        # ----- classifier ---------------------------------------------------
         self.classifier = nn.Sequential(
-            nn.Linear(classifier_input_dim, classifier_hidden_dim),
+            nn.Linear(classifier_in, cls_hidden_dim),
             nn.GELU(),
-            nn.LayerNorm(classifier_hidden_dim),
-            nn.Dropout(classifier_dropout),
-            nn.Linear(classifier_hidden_dim, num_classes),
+            nn.Dropout(cls_dropout),
+            nn.Linear(cls_hidden_dim, num_classes),
         )
-        
         self._init_classifier()
 
+    # ---------------------------------------------------------------------- #
+    # helpers
+    # ---------------------------------------------------------------------- #
     def _modify_input_channels(self, in_channels: int, pretrained: bool) -> None:
-        """Modify the first conv layer to accept different number of input channels."""
-        # For Swin transformers
-        if hasattr(self.backbone, "patch_embed"):
-            patch_embed = self.backbone.patch_embed
-            
-            if hasattr(patch_embed, "proj"):
-                old_conv = patch_embed.proj
-                new_conv = nn.Conv2d(
-                    in_channels,
-                    old_conv.out_channels,
-                    kernel_size=old_conv.kernel_size,
-                    stride=old_conv.stride,
-                    padding=old_conv.padding,
-                    bias=old_conv.bias is not None,
-                )
-                
-                # Copy weights for first 3 channels if pretrained
-                if pretrained:
-                    with torch.no_grad():
-                        new_conv.weight[:, :3, :, :] = old_conv.weight
-                        # Initialize new channel(s) with mean of existing channels
-                        new_conv.weight[:, 3:, :, :] = old_conv.weight.mean(dim=1, keepdim=True)
-                        if old_conv.bias is not None:
-                            new_conv.bias = old_conv.bias
-                
-                patch_embed.proj = new_conv
-                print(f"[Model] Modified patch_embed.proj to accept {in_channels} channels")
-        
-        # For ViT models
-        elif hasattr(self.backbone, "patch_embed") and hasattr(self.backbone.patch_embed, "backbone"):
-            # timm hybrid ViT
-            backbone = self.backbone.patch_embed.backbone
-            if hasattr(backbone, "stem"):
-                old_conv = backbone.stem.conv
-                new_conv = nn.Conv2d(
-                    in_channels,
-                    old_conv.out_channels,
-                    kernel_size=old_conv.kernel_size,
-                    stride=old_conv.stride,
-                    padding=old_conv.padding,
-                    bias=old_conv.bias is not None,
-                )
-                if pretrained:
-                    with torch.no_grad():
-                        new_conv.weight[:, :3, :, :] = old_conv.weight
-                        new_conv.weight[:, 3:, :, :] = old_conv.weight.mean(dim=1, keepdim=True)
-                        if old_conv.bias is not None:
-                            new_conv.bias = old_conv.bias
-                backbone.stem.conv = new_conv
-                print(f"[Model] Modified stem.conv to accept {in_channels} channels")
+        """Modify first projection to accept `in_channels` channels."""
+        if hasattr(self.backbone, "patch_embed") and hasattr(self.backbone.patch_embed, "proj"):
+            old = self.backbone.patch_embed.proj
+            new = nn.Conv2d(
+                in_channels, old.out_channels,
+                kernel_size=old.kernel_size, stride=old.stride,
+                padding=old.padding, bias=(old.bias is not None),
+            )
+            if pretrained:
+                with torch.no_grad():
+                    new.weight[:, :3] = old.weight
+                    new.weight[:, 3:] = old.weight.mean(dim=1, keepdim=True)
+                    if old.bias is not None:
+                        new.bias.copy_(old.bias)
+            self.backbone.patch_embed.proj = new
+            print(f"[Model] patch_embed.proj → {in_channels} channels")
 
     def _init_classifier(self) -> None:
-        """Initialize classifier weights."""
         for m in self.classifier.modules():
             if isinstance(m, nn.Linear):
                 nn.init.trunc_normal_(m.weight, std=0.02)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+    # ---------------------------------------------------------------------- #
+    # forward
+    # ---------------------------------------------------------------------- #
     def forward(
         self,
         x: torch.Tensor,
-        metadata: Optional[Dict[str, torch.Tensor]] = None,
+        metadata: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Parameters
         ----------
-        x : torch.Tensor
-            Input images (B, C, H, W) where C is 3 or 4.
-        metadata : Optional[Dict]
-            Metadata dict with "age", "sex", "site" tensors.
-        
+        x        : (B, C, H, W)
+        metadata : (B, meta_input_dim)  — flat vector of [age, sex_oh, site_oh]
+
         Returns
         -------
-        dict
-            {"logits": (B, num_classes)}
+        {"logits": (B, num_classes)}
         """
-        # Backbone forward
         features = self.backbone(x)  # (B, backbone_dim)
-        
-        # Metadata fusion
-        if self.metadata_enabled and metadata is not None:
-            meta_emb = self.metadata_embed(
-                metadata["age"],
-                metadata["sex"],
-                metadata["site"],
-            )
+
+        if self.metadata_enabled:
+            if metadata is not None:
+                meta_emb = self.metadata_branch(metadata)  # (B, meta_out)
+            else:
+                # Zero-fill metadata embedding so classifier dim stays consistent
+                meta_emb = torch.zeros(
+                    features.size(0), self.metadata_branch.output_dim,
+                    device=features.device, dtype=features.dtype,
+                )
             features = torch.cat([features, meta_emb], dim=1)
-        
-        # Classifier
+
         logits = self.classifier(features)
-        
         return {"logits": logits}
 
+    # ---------------------------------------------------------------------- #
+    # freeze / unfreeze
+    # ---------------------------------------------------------------------- #
     def freeze_backbone(self) -> None:
-        """Freeze backbone parameters."""
-        for param in self.backbone.parameters():
-            param.requires_grad = False
-        print("[Model] Backbone frozen")
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+        print("[Model] backbone frozen")
 
     def unfreeze_backbone(self) -> None:
-        """Unfreeze backbone parameters."""
-        for param in self.backbone.parameters():
-            param.requires_grad = True
-        print("[Model] Backbone unfrozen")
+        for p in self.backbone.parameters():
+            p.requires_grad = True
+        print("[Model] backbone unfrozen")
 
     def get_head_parameters(self) -> List[Dict]:
-        """Get classifier and metadata embedding parameters."""
         params = list(self.classifier.parameters())
         if self.metadata_enabled:
-            params.extend(list(self.metadata_embed.parameters()))
+            params += list(self.metadata_branch.parameters())
         return [{"params": params}]
 
     def get_layerwise_lr_groups(
         self,
-        base_lr: float = 5e-5,
+        base_lr: float = 1e-4,
         decay_rate: float = 0.75,
-        weight_decay: float = 0.05,
+        weight_decay: float = 1e-5,
     ) -> List[Dict]:
-        """Get parameter groups with layer-wise learning rate decay."""
-        params = []
-        
-        # Get number of layers
+        groups: List[Dict] = []
+
+        # determine number of stages/layers
         if hasattr(self.backbone, "layers"):
-            num_layers = len(self.backbone.layers)
+            layers = list(self.backbone.layers)
         elif hasattr(self.backbone, "blocks"):
-            num_layers = len(self.backbone.blocks)
+            layers = list(self.backbone.blocks)
         else:
-            num_layers = 12  # Default
-        
-        # Patch embedding (lowest LR)
+            layers = []
+
+        n_layers = len(layers)
+
+        # patch embed (lowest LR)
         if hasattr(self.backbone, "patch_embed"):
-            lr = base_lr * (decay_rate ** (num_layers + 1))
-            params.append({
-                "params": list(self.backbone.patch_embed.parameters()),
-                "lr": lr,
-                "weight_decay": weight_decay,
-            })
-        
-        # Transformer layers
-        if hasattr(self.backbone, "layers"):
-            for i, layer in enumerate(self.backbone.layers):
-                lr = base_lr * (decay_rate ** (num_layers - i))
-                params.append({
-                    "params": list(layer.parameters()),
-                    "lr": lr,
-                    "weight_decay": weight_decay,
-                })
-        elif hasattr(self.backbone, "blocks"):
-            for i, block in enumerate(self.backbone.blocks):
-                lr = base_lr * (decay_rate ** (num_layers - i))
-                params.append({
-                    "params": list(block.parameters()),
-                    "lr": lr,
-                    "weight_decay": weight_decay,
-                })
-        
-        # Norm layer
+            lr = base_lr * (decay_rate ** (n_layers + 1))
+            groups.append({"params": list(self.backbone.patch_embed.parameters()),
+                           "lr": lr, "weight_decay": weight_decay})
+
+        # transformer stages
+        for i, layer in enumerate(layers):
+            lr = base_lr * (decay_rate ** (n_layers - i))
+            groups.append({"params": list(layer.parameters()),
+                           "lr": lr, "weight_decay": weight_decay})
+
+        # norm
         if hasattr(self.backbone, "norm"):
-            params.append({
-                "params": list(self.backbone.norm.parameters()),
-                "lr": base_lr,
-                "weight_decay": weight_decay,
-            })
-        
-        # Classifier head (highest LR)
+            groups.append({"params": list(self.backbone.norm.parameters()),
+                           "lr": base_lr, "weight_decay": weight_decay})
+
+        # head (10× base LR)
         head_params = list(self.classifier.parameters())
         if self.metadata_enabled:
-            head_params.extend(list(self.metadata_embed.parameters()))
-        
-        params.append({
-            "params": head_params,
-            "lr": base_lr * 10,  # Higher LR for head
-            "weight_decay": weight_decay,
-        })
-        
-        return params
+            head_params += list(self.metadata_branch.parameters())
+        groups.append({"params": head_params, "lr": base_lr * 10,
+                       "weight_decay": weight_decay})
+
+        return groups
 
     def count_parameters(self) -> Dict[str, int]:
-        """Count model parameters."""
-        backbone_params = sum(p.numel() for p in self.backbone.parameters())
-        classifier_params = sum(p.numel() for p in self.classifier.parameters())
-        
-        counts = {
+        d: Dict[str, int] = {
             "total": sum(p.numel() for p in self.parameters()),
-            "backbone": backbone_params,
-            "classifier": classifier_params,
+            "backbone": sum(p.numel() for p in self.backbone.parameters()),
+            "classifier": sum(p.numel() for p in self.classifier.parameters()),
         }
-        
         if self.metadata_enabled:
-            counts["metadata"] = sum(p.numel() for p in self.metadata_embed.parameters())
-        
-        return counts
+            d["metadata"] = sum(p.numel() for p in self.metadata_branch.parameters())
+        return d
 
 
 # ============================================================================
-# Model Builder
+# Factory
 # ============================================================================
+
+def get_layerwise_lr_groups(
+    model: ISICClassifier,
+    base_lr: float = 1e-4,
+    decay_rate: float = 0.75,
+    weight_decay: float = 1e-5,
+) -> List[Dict]:
+    """Standalone wrapper around ISICClassifier.get_layerwise_lr_groups."""
+    return model.get_layerwise_lr_groups(base_lr, decay_rate, weight_decay)
+
+
+def count_parameters(model: ISICClassifier) -> int:
+    """Return total trainable parameter count."""
+    return sum(p.numel() for p in model.parameters())
+
 
 def build_model(config: dict) -> ISICClassifier:
-    """Build model from config.
-    
-    Parameters
-    ----------
-    config : dict
-        Configuration dictionary.
-    
-    Returns
-    -------
-    ISICClassifier
-        Model instance.
-    """
-    model_cfg = config.get("model", {})
-    data_cfg = config.get("data", {})
-    
-    # Determine input channels
-    use_segmentation_mask = data_cfg.get("use_segmentation_mask", False)
-    in_channels = 4 if use_segmentation_mask else 3
-    
+    m = config.get("model", {})
+    d = config.get("data", {})
+    meta = m.get("metadata", {})
+    cls  = m.get("classifier", {})
+
+    in_ch = 4 if d.get("use_segmentation_mask", False) else 3
+
     return ISICClassifier(
-        backbone_name=model_cfg.get("backbone", "swin_small_patch4_window7_224.ms_in22k_ft_in1k"),
-        num_classes=model_cfg.get("num_classes", 8),
-        image_size=model_cfg.get("image_size", 224),
-        in_channels=in_channels,
-        pretrained=model_cfg.get("pretrained", True),
-        drop_path_rate=float(model_cfg.get("drop_path_rate", 0.2)),
-        metadata_enabled=model_cfg.get("metadata", {}).get("enabled", False),
-        metadata_embed_dim=model_cfg.get("metadata", {}).get("embed_dim", 64),
-        classifier_hidden_dim=model_cfg.get("classifier", {}).get("hidden_dim", 512),
-        classifier_dropout=float(model_cfg.get("classifier", {}).get("dropout", 0.3)),
+        backbone_name=m.get("backbone", "swinv2_large_window12to24_192to384.ms_in22k_ft_in1k"),
+        num_classes=m.get("num_classes", 8),
+        image_size=m.get("image_size", 384),
+        in_channels=in_ch,
+        pretrained=m.get("pretrained", True),
+        drop_path_rate=float(m.get("drop_path_rate", 0.4)),
+        metadata_enabled=meta.get("enabled", True),
+        meta_input_dim=int(meta.get("input_dim", 13)),
+        meta_hidden_dim=int(meta.get("hidden_dim", 256)),
+        meta_output_dim=int(meta.get("output_dim", 128)),
+        meta_dropout=float(meta.get("dropout", 0.4)),
+        cls_hidden_dim=int(cls.get("hidden_dim", 512)),
+        cls_dropout=float(cls.get("dropout", 0.5)),
     )

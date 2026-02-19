@@ -1,109 +1,146 @@
 # ============================================================================
-# ISIC 2019 Classification with Precomputed Segmentation Masks
+# ISIC 2019 — Production Training Config
 # ============================================================================
-# Optimized for efficiency: 224px, single split, no EMA during tuning
+# SwinV2-Large-384 · Metadata Fusion · 5-Fold CV · EMA · Strong TTA · AMP
 
 seed: 42
-device: "auto"  # auto, mps, cuda, cpu
+device: "auto"  # auto | cuda | mps | cpu
 
-# Data paths
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
 data:
   isic_dir: "./ISIC"
-  
-  # Segmentation mask settings
   use_segmentation_mask: true
   segmentation_mask_dir: "./masks"
 
-# Classes (8-class, no UNK)
+# ---------------------------------------------------------------------------
+# Classes
+# ---------------------------------------------------------------------------
 classes:
   names: ["MEL", "NV", "BCC", "AK", "BKL", "DF", "VASC", "SCC"]
   num_classes: 8
 
-# Model architecture
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
 model:
-  # Backbone options: 
-  # - "swin_small_patch4_window7_224.ms_in22k_ft_in1k" (22M params, fast)
-  # - "swin_base_patch4_window7_224.ms_in22k_ft_in1k" (87M params)
-  backbone: "swin_small_patch4_window7_224.ms_in22k_ft_in1k"
-  image_size: 224
+  backbone: "swinv2_large_window12to24_192to384.ms_in22k_ft_in1k"
+  image_size: 384
   num_classes: 8
   pretrained: true
-  drop_path_rate: 0.2
-  
-  # Metadata fusion (optional)
+  drop_path_rate: 0.4
+
   metadata:
-    enabled: false  # Disable for faster debugging
-    embed_dim: 64
-    
-  # Classifier head
+    enabled: true
+    # Inputs: age (1) + sex one-hot (3) + site one-hot (9) = 13
+    input_dim: 13
+    hidden_dim: 256
+    output_dim: 128
+    dropout: 0.4
+
   classifier:
     hidden_dim: 512
-    dropout: 0.3
+    dropout: 0.5
 
+# ---------------------------------------------------------------------------
 # Training
+# ---------------------------------------------------------------------------
 training:
-  # Two-stage training
-  stage1:
-    epochs: 5
-    lr: 0.001
-    freeze_backbone: true
-    
-  stage2:
-    epochs: 25
-    lr: 0.00005
-    freeze_backbone: false
-    
-  # General
-  batch_size: 32
-  val_ratio: 0.2
-  weight_decay: 0.05
-  grad_clip: 1.0
-  num_workers: 0  # MPS-safe
-  
+  epochs: 80
+  batch_size: 4              # physical batch per GPU (safe for A40 + SwinV2-L @ 384)
+  gradient_accumulation_steps: 4   # effective batch = 4×4 = 16
+  auto_batch_size: false
+  num_workers: 8
+  pin_memory: true
+
+  # Optimizer
+  optimizer:
+    lr: 0.0001
+    weight_decay: 0.00001
+
+  # Scheduler — cosine with warmup
+  scheduler:
+    warmup_epochs: 5
+    min_lr: 0.000001
+
   # Layer-wise LR decay
   llrd:
     enabled: true
     decay_rate: 0.75
-    
-  # Scheduler
-  scheduler:
-    type: "cosine"
-    warmup_epochs: 3
-    min_lr: 0.0000001
 
+  # Gradient clipping
+  grad_clip: 1.0
+
+  # Mixed precision
+  use_amp: true
+
+  # WeightedRandomSampler
+  use_weighted_sampler: true
+
+  # 5-fold stratified CV
+  cv:
+    enabled: true
+    n_splits: 5
+
+  # EMA
+  ema:
+    enabled: true
+    decay: 0.9995
+
+  # Early stopping
+  early_stopping:
+    patience: 15
+    metric: "balanced_accuracy"   # val metric to monitor
+
+  # TTA at inference
+  tta:
+    enabled: true
+    n: 8   # 8 deterministic transforms (see data.py)
+
+# ---------------------------------------------------------------------------
 # Augmentation
+# ---------------------------------------------------------------------------
 augmentation:
-  # MixUp / CutMix
+  # Train
+  train:
+    random_resized_crop:
+      scale: [0.7, 1.0]
+      ratio: [0.9, 1.1]
+    horizontal_flip: true
+    vertical_flip: true
+    rotation: 30
+    color_jitter:
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.2
+      hue: 0.0
+    randaugment:
+      enabled: true
+      n: 3
+      m: 12
+  # MixUp / CutMix (applied on GPU in training loop)
   mixup:
     enabled: true
-    alpha: 0.2
+    alpha: 0.4
   cutmix:
     enabled: true
     alpha: 1.0
-    prob: 0.5
-    
-  # RandAugment (applied in dataset)
-  randaugment:
-    enabled: true
-    n: 2
-    m: 9
+    prob: 0.7
 
-# Loss
+# ---------------------------------------------------------------------------
+# Loss — Asymmetric Focal (no class weights)
+# ---------------------------------------------------------------------------
 loss:
-  type: "asymmetric"  # asymmetric, focal, cross_entropy
-  class_weights: true
-  label_smoothing: 0.0
-  
-  # Asymmetric Loss params
+  type: "asymmetric"
+  class_weights: false
   asymmetric:
     gamma_neg: 4
     gamma_pos: 1
     clip: 0.05
-    
-  # Focal Loss params (if type: focal)
-  focal:
-    gamma: 2.0
 
+# ---------------------------------------------------------------------------
 # Checkpoint
+# ---------------------------------------------------------------------------
 checkpoint:
   dir: "./checkpoints"
